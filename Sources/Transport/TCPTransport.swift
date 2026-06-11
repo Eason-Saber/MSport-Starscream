@@ -35,7 +35,8 @@ public class TCPTransport: Transport {
     private weak var delegate: TransportEventClient?
     private var isRunning = false
     private var isTLS = false
-   
+    private let mutex = DispatchSemaphore(value: 1)
+    
     deinit {
         disconnect()
     }
@@ -82,14 +83,18 @@ public class TCPTransport: Transport {
         }
         let parameters = NWParameters(tls: tlsOptions, tcp: options)
         let conn = NWConnection(host: NWEndpoint.Host.name(parts.host, nil), port: NWEndpoint.Port(rawValue: UInt16(parts.port))!, using: parameters)
+        mutex.wait()
         connection = conn
+        mutex.signal()
         start()
     }
     
     public func disconnect() {
+        mutex.wait()
         isRunning = false
         connection?.cancel()
         connection = nil
+        mutex.signal()
     }
     
     public func register(delegate: TransportEventClient) {
@@ -97,15 +102,35 @@ public class TCPTransport: Transport {
     }
     
     public func write(data: Data, completion: @escaping ((Error?) -> ())) {
-        connection?.send(content: data, completion: .contentProcessed { (error) in
-            completion(error)
-        })
+        
+        queue.async { [weak self] in
+            guard let s = self else { return }
+            
+            s.mutex.wait()
+            let con = s.connection
+            let running = s.isRunning
+            s.mutex.signal()
+            
+            guard running, let c = con else {
+                completion(NSError(domain: "TCPTransport", code: -1, userInfo: nil))
+                return
+            }
+            
+            c.send(content: data, completion: .contentProcessed({ error in
+                completion(error)
+            }))
+        }
     }
     
     private func start() {
+        mutex.wait()
+        let connection = connection
+        mutex.signal()
+        
         guard let conn = connection else {
             return
         }
+        
         conn.stateUpdateHandler = { [weak self] (newState) in
             switch newState {
             case .ready:
@@ -132,16 +157,24 @@ public class TCPTransport: Transport {
         }
         
         conn.start(queue: queue)
+        mutex.wait()
         isRunning = true
+        mutex.signal()
         readLoop()
     }
     
     //readLoop keeps reading from the connection to get the latest content
     private func readLoop() {
-        if !isRunning {
+        mutex.wait()
+        let running = isRunning
+        let con = connection
+        mutex.signal()
+        
+        guard running, let c = con else {
             return
         }
-        connection?.receive(minimumIncompleteLength: 2, maximumLength: 4096, completion: {[weak self] (data, context, isComplete, error) in
+        
+        c.receive(minimumIncompleteLength: 2, maximumLength: 4096, completion: {[weak self] (data, context, isComplete, error) in
             guard let s = self else {return}
             if let data = data {
                 s.delegate?.connectionChanged(state: .receive(data))
